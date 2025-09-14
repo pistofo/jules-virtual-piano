@@ -18,13 +18,46 @@
 //  FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER 
 //  DEALINGS IN THE SOFTWARE.
 
-import WASMAudioBuffer from './util/WASMAudioBuffer.js';
+// Inlined WASMAudioBuffer (AudioWorklet cannot reliably use static imports across
+// all browsers/servers). This is adapted from ./util/WASMAudioBuffer.js
+const BYTES_PER_UNIT = Uint16Array.BYTES_PER_ELEMENT;
+const BYTES_PER_SAMPLE = Float32Array.BYTES_PER_ELEMENT;
+const MAX_CHANNEL_COUNT = 32;
+class WASMAudioBuffer {
+  constructor(wasmModule, length, channelCount, maxChannelCount) {
+    this._isInitialized = false;
+    this._module = wasmModule;
+    this._length = length;
+    this._maxChannelCount = maxChannelCount ? Math.min(maxChannelCount, MAX_CHANNEL_COUNT) : channelCount;
+    this._channelCount = channelCount;
+    this._allocateHeap();
+    this._isInitialized = true;
+  }
+  _allocateHeap() {
+    const channelByteSize = this._length * BYTES_PER_SAMPLE;
+    const dataByteSize = this._channelCount * channelByteSize;
+    this._dataPtr = this._module._malloc(dataByteSize);
+    this._channelData = [];
+    for (let i = 0; i < this._channelCount; ++i) {
+      let startByteOffset = this._dataPtr + i * channelByteSize;
+      let endByteOffset = startByteOffset + channelByteSize;
+      this._channelData[i] = this._module.HEAPF32.subarray(startByteOffset >> BYTES_PER_UNIT, endByteOffset >> BYTES_PER_UNIT);
+    }
+  }
+  adaptChannel(newChannelCount) { if (newChannelCount < this._maxChannelCount) this._channelCount = newChannelCount; }
+  get length() { return this._isInitialized ? this._length : null; }
+  get numberOfChannels() { return this._isInitialized ? this._channelCount : null; }
+  get maxChannelCount() { return this._isInitialized ? this._maxChannelCount : null; }
+  getChannelData(channelIndex) { if (channelIndex >= this._channelCount) return null; return typeof channelIndex === 'undefined' ? this._channelData : this._channelData[channelIndex]; }
+  getF32Array() { return this._channelData[0]; }
+  getPointer() { return this._dataPtr; }
+  free() { this._isInitialized = false; this._module._free(this._dataPtr); this._module._free(this._pointerArrayPtr); this._channelData = null; }
+}
 
 // Lazy-load the sfizz Emscripten glue as an ES module using a blob URL to avoid
 // cross-origin module quirks in AudioWorklet. We try local first, then upstream raw.
 async function loadSfizzGlue() {
   const candidates = [
-    new URL('./build/sfizz.wasm.js', import.meta.url).href,
     'https://raw.githubusercontent.com/sfztools/sfizz-webaudio/www/build/sfizz.wasm.js',
   ];
   let lastErr = null;
