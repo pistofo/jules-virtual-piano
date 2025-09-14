@@ -54,38 +54,21 @@ class WASMAudioBuffer {
   free() { this._isInitialized = false; this._module._free(this._dataPtr); this._module._free(this._pointerArrayPtr); this._channelData = null; }
 }
 
-// Lazy-load the sfizz Emscripten glue as an ES module using a blob URL to avoid
-// cross-origin module quirks in AudioWorklet. We try local first, then upstream raw.
-async function loadSfizzGlue() {
-  const candidates = [
-    'https://raw.githubusercontent.com/sfztools/sfizz-webaudio/www/build/sfizz.wasm.js',
-  ];
-  let lastErr = null;
-  for (const url of candidates) {
-    try {
-      const res = await fetch(url, { mode: 'cors' });
-      if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
-      let code = await res.text();
-      // If the glue is a classic script without an ESM default export, append one.
-      if (!/export\s+default\s+Module\s*;?$/m.test(code)) {
-        code += '\nexport default Module;\n';
-      }
-      const blob = new Blob([code], { type: 'text/javascript' });
-      const blobUrl = URL.createObjectURL(blob);
-      const mod = await import(blobUrl);
-      return mod.default;
-    } catch (e) {
-      lastErr = e;
-    }
-  }
-  throw lastErr ?? new Error('Failed to load sfizz glue');
+// Build a module URL for the Emscripten glue from provided source and inject
+// the wasm bytes so the glue does not try to fetch() in the AudioWorklet.
+function buildGlueModuleUrl(glueSource, wasmBytes) {
+  // Expose a preset Module via the global so the glue will reuse it instead of creating a new one.
+  // We also ensure an ESM default export at the end.
+  const prefix = 'var Module = (globalThis.__sfizzModule || {});\n';
+  const suffix = '\nexport default Module;\n';
+  return URL.createObjectURL(new Blob([prefix, glueSource, suffix], { type: 'text/javascript' }));
 }
 
 // Web Audio API's render block size
 const NUM_FRAMES = 128;
 
 class SfizzProcessor extends AudioWorkletProcessor {
-  constructor() {
+  constructor(options) {
     super();
     // Defer initialization until WASM glue is loaded
     this._ready = false;
@@ -94,32 +77,51 @@ class SfizzProcessor extends AudioWorkletProcessor {
     this._rightBuffer = null;
     this._activeVoices = 0;
     this.port.onmessage = this._handleMessage.bind(this);
-    loadSfizzGlue()
-      .then((Module) => {
-        this._synth = new Module.SfizzWrapper(sampleRate);
-        this._leftBuffer = new WASMAudioBuffer(Module, NUM_FRAMES, 1, 1);
-        this._rightBuffer = new WASMAudioBuffer(Module, NUM_FRAMES, 1, 1);
-        this._ready = true;
-        this.port.postMessage({ type: 'sfizz_ready' });
-      })
-      .catch((e) => {
-        // Surface error to main thread for debugging
-        this.port.postMessage({ type: 'sfizz_error', message: String(e && e.message || e) });
-      });
+    try {
+      const glueSource = options?.processorOptions?.glueSource;
+      const wasmBytes = options?.processorOptions?.wasmBytes; // Uint8Array
+      if (!glueSource || !wasmBytes) {
+        throw new Error('Missing glueSource or wasmBytes');
+      }
+      // Seed Module with the binary so the glue will instantiate without network
+      globalThis.__sfizzModule = { wasmBinary: wasmBytes, locateFile: (p) => p };
+      const moduleUrl = buildGlueModuleUrl(glueSource, wasmBytes);
+      import(moduleUrl)
+        .then((mod) => mod.default)
+        .then((Module) => {
+          this._synth = new Module.SfizzWrapper(sampleRate);
+          this._leftBuffer = new WASMAudioBuffer(Module, NUM_FRAMES, 1, 1);
+          this._rightBuffer = new WASMAudioBuffer(Module, NUM_FRAMES, 1, 1);
+          this._ready = true;
+          this.port.postMessage({ type: 'sfizz_ready' });
+        })
+        .catch((e) => this.port.postMessage({ type: 'sfizz_error', message: String(e && e.message || e) }));
+    } catch (e) {
+      this.port.postMessage({ type: 'sfizz_error', message: String(e && e.message || e) });
+    }
   }
 
   process(inputs, outputs) {
     if (!this._ready || !this._synth) {
       // Zero-fill until the engine is ready
       if (outputs && outputs[0] && outputs[0][0]) outputs[0][0].fill(0);
+      if (outputs && outputs[0] && outputs[0][1]) outputs[0][1].fill(0);
+      // Legacy two-mono-outputs fallback
       if (outputs && outputs[1] && outputs[1][0]) outputs[1][0].fill(0);
       return true;
     }
     // Call the render function to fill the WASM buffer. Then clone the
     // rendered data to process() callback's output buffer.
     this._synth.render(this._leftBuffer.getPointer(), this._rightBuffer.getPointer(), NUM_FRAMES);
-    outputs[0][0].set(this._leftBuffer.getF32Array());
-    outputs[1][0].set(this._rightBuffer.getF32Array());
+    // Prefer a single 2-channel output
+    if (outputs && outputs[0]) {
+      if (outputs[0][0]) outputs[0][0].set(this._leftBuffer.getF32Array());
+      if (outputs[0][1]) outputs[0][1].set(this._rightBuffer.getF32Array());
+    } else if (outputs && outputs[1]) {
+      // Fallback: two separate mono outputs
+      if (outputs[0] && outputs[0][0]) outputs[0][0].set(this._leftBuffer.getF32Array());
+      if (outputs[1] && outputs[1][0]) outputs[1][0].set(this._rightBuffer.getF32Array());
+    }
     const activeVoices = this._synth.numActiveVoices();
     if (activeVoices != this._activeVoices) {
       this.port.postMessage({ activeVoices: this._synth.numActiveVoices() });
