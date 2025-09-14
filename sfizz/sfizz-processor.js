@@ -18,8 +18,35 @@
 //  FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER 
 //  DEALINGS IN THE SOFTWARE.
 
-import Module from 'https://cdn.jsdelivr.net/gh/sfztools/sfizz-webaudio@www/build/sfizz.wasm.js';
 import WASMAudioBuffer from './util/WASMAudioBuffer.js';
+
+// Lazy-load the sfizz Emscripten glue as an ES module using a blob URL to avoid
+// cross-origin module quirks in AudioWorklet. We try local first, then upstream raw.
+async function loadSfizzGlue() {
+  const candidates = [
+    new URL('./build/sfizz.wasm.js', import.meta.url).href,
+    'https://raw.githubusercontent.com/sfztools/sfizz-webaudio/www/build/sfizz.wasm.js',
+  ];
+  let lastErr = null;
+  for (const url of candidates) {
+    try {
+      const res = await fetch(url, { mode: 'cors' });
+      if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
+      let code = await res.text();
+      // If the glue is a classic script without an ESM default export, append one.
+      if (!/export\s+default\s+Module\s*;?$/m.test(code)) {
+        code += '\nexport default Module;\n';
+      }
+      const blob = new Blob([code], { type: 'text/javascript' });
+      const blobUrl = URL.createObjectURL(blob);
+      const mod = await import(blobUrl);
+      return mod.default;
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr ?? new Error('Failed to load sfizz glue');
+}
 
 // Web Audio API's render block size
 const NUM_FRAMES = 128;
@@ -27,16 +54,34 @@ const NUM_FRAMES = 128;
 class SfizzProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
-    // Create an instance of Synthesizer and WASM memory helper. Then set up an
-    // event handler for MIDI data from the main thread.
-    this._synth = new Module.SfizzWrapper(sampleRate);
-    this._leftBuffer = new WASMAudioBuffer(Module, NUM_FRAMES, 1, 1);
-    this._rightBuffer = new WASMAudioBuffer(Module, NUM_FRAMES, 1, 1);
+    // Defer initialization until WASM glue is loaded
+    this._ready = false;
+    this._synth = null;
+    this._leftBuffer = null;
+    this._rightBuffer = null;
     this._activeVoices = 0;
     this.port.onmessage = this._handleMessage.bind(this);
+    loadSfizzGlue()
+      .then((Module) => {
+        this._synth = new Module.SfizzWrapper(sampleRate);
+        this._leftBuffer = new WASMAudioBuffer(Module, NUM_FRAMES, 1, 1);
+        this._rightBuffer = new WASMAudioBuffer(Module, NUM_FRAMES, 1, 1);
+        this._ready = true;
+        this.port.postMessage({ type: 'sfizz_ready' });
+      })
+      .catch((e) => {
+        // Surface error to main thread for debugging
+        this.port.postMessage({ type: 'sfizz_error', message: String(e && e.message || e) });
+      });
   }
 
   process(inputs, outputs) {
+    if (!this._ready || !this._synth) {
+      // Zero-fill until the engine is ready
+      if (outputs && outputs[0] && outputs[0][0]) outputs[0][0].fill(0);
+      if (outputs && outputs[1] && outputs[1][0]) outputs[1][0].fill(0);
+      return true;
+    }
     // Call the render function to fill the WASM buffer. Then clone the
     // rendered data to process() callback's output buffer.
     this._synth.render(this._leftBuffer.getPointer(), this._rightBuffer.getPointer(), NUM_FRAMES);
@@ -52,6 +97,7 @@ class SfizzProcessor extends AudioWorkletProcessor {
 
   _handleMessage(event) {
     const data = event.data;
+    if (!this._ready || !this._synth) return;
     switch (data.type) {
       case 'note_on':
         this._synth.noteOn(0, data.number, data.value);
